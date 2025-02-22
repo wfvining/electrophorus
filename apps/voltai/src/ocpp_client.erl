@@ -6,7 +6,8 @@
 
 -behavior(gen_statem).
 
--export([start_link/4, connect/3, send_boot_notification/3, send_status_notification/4, send_heartbeat/1]).
+-export([start_link/4, connect/3, send_boot_notification/3, send_status_notification/4,
+         send_heartbeat/1, rpcreply/4, send_report/2]).
 -export([callback_mode/0, init/1]).
 -export([disconnected/3, upgrade/3, connected/3]).
 
@@ -33,11 +34,16 @@ send_boot_notification(Conn, Reason, Station) ->
     gen_statem:call(Conn, {send_boot, Reason, Station}).
 
 send_status_notification(Conn, EVSEId, ConnectorId, Status) ->
-    Time = list_to_binary(
-             calendar:system_time_to_rfc3339(
-               erlang:system_time(second),
-               [{offset, "Z"}, {unit, second}])),
+    Time =
+        list_to_binary(calendar:system_time_to_rfc3339(
+                           erlang:system_time(second), [{offset, "Z"}, {unit, second}])),
     gen_statem:call(Conn, {send_status, EVSEId, ConnectorId, Status, Time}).
+
+send_report(Conn, Payload) ->
+    gen_statem:call(Conn, {send_report, Payload}).
+
+rpcreply(Conn, MessageId, Type, Payload) ->
+    gen_statem:cast(Conn, {rpcreply, MessageId, Type, Payload}).
 
 init({URL, UserName, Password, StationPid}) ->
     {ok,
@@ -91,15 +97,22 @@ connected({call, From}, {send_boot, Reason, Station}, State) ->
                                    [{"chargingStation", Station}, {"reason", Reason}]),
     RPCCall = ocpp_rpc:encode_call(Msg),
     ok = gun:ws_send(State#state.conn, State#state.ws, [{text, RPCCall}]),
-    {keep_state, 
-     State#state{pending = [{ocpp_message:id(Msg), 'BootNotification', From} | State#state.pending]}};
+    {keep_state,
+     State#state{pending =
+                     [{ocpp_message:id(Msg), 'BootNotification', From} | State#state.pending]}};
 connected({call, From}, {send_status, EVSEId, ConnectorId, Status, Time}, State) ->
-    Msg = ocpp_message:new_request(
-            'StatusNotification',
-            #{timestamp => Time,
-              connectorStatus => Status,
-              evseId => EVSEId,
-              connectorId => ConnectorId}),
+    Msg = ocpp_message:new_request('StatusNotification',
+                                   #{timestamp => Time,
+                                     connectorStatus => Status,
+                                     evseId => EVSEId,
+                                     connectorId => ConnectorId}),
+    RPCCall = ocpp_rpc:encode_call(Msg),
+    ok = gun:ws_send(State#state.conn, State#state.ws, [{text, RPCCall}]),
+    {keep_state,
+     State#state{pending =
+                     [{ocpp_message:id(Msg), 'StatusNotification', From} | State#state.pending]}};
+connected({call, From}, {send_report, Payload}, State) ->
+    Msg = ocpp_message:new_request('NotifyReport', Payload),
     RPCCall = ocpp_rpc:encode_call(Msg),
     ok = gun:ws_send(State#state.conn, State#state.ws, [{text, RPCCall}]),
     {keep_state, 
@@ -108,7 +121,13 @@ connected({call, From}, send_heartbeat, State) ->
     Msg = ocpp_message:new_request('Heartbeat', #{}),
     RPCCall = ocpp_rpc:encode_call(Msg),
     ok = gun:ws_send(State#state.conn, State#state.ws, [{text, RPCCall}]),
-    {keep_state, State#state{pending = [{ocpp_message:id(Msg), 'Heartbeat', From} | State#state.pending]}};
+    {keep_state,
+     State#state{pending = [{ocpp_message:id(Msg), 'Heartbeat', From} | State#state.pending]}};
+connected(cast, {rpcreply, MessageId, Type, Payload}, State) ->
+    Msg = ocpp_message:new_response(Type, Payload, MessageId),
+    RPCCall = ocpp_rpc:encode_callresult(Msg),
+    gun:ws_send(State#state.conn, State#state.ws, [{text, RPCCall}]),
+    {keep_state, State};
 connected(info, {gun_down, _, _, _, _, _}, _State) ->
     {stop, connection_down};
 connected(info, {gun_ws, _, _, {close, _}}, State) ->
@@ -119,15 +138,16 @@ connected(info, {gun_ws, _, _, {text, Msg}}, State) ->
         {ok, {callresult, MessageId, Message}} ->
             case lists:keytake(MessageId, 1, State#state.pending) of
                 {value, {_, Type, From}, Pending} ->
-                    gen_statem:reply(From, {ok, ocpp_message:new_response(Type, Message, MessageId)}),
+                    gen_statem:reply(From,
+                                     {ok, ocpp_message:new_response(Type, Message, MessageId)}),
                     {keep_state, State#state{pending = Pending}};
                 false ->
                     logger:warning("Got unexpected OCPP CALLRESULT message for ~p: ~p ~p",
                                    [State#state.station, MessageId, Message]),
                     keep_state_and_data
             end;
-        {ok, {call, MessageId, Message}} ->
-            logger:warning("got call from CSMS: ~p", [Message]),
+        {ok, {call, _MessageId, Message}} ->
+            State#state.station ! {ocpp, {call, Message}},
             keep_state_and_data;
         {ok, {callerror, Error}} ->
             MessageId = ocpp_error:id(Error),

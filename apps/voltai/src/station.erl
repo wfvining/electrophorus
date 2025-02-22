@@ -113,9 +113,46 @@ handle_cast({arrival, SoC, Token}, State) ->
     {noreply, State#state{queue = queue:in({SoC, Token}, State#state.queue)},
      {continue, check_queue}}.
 
+handle_info({ocpp, {call, Message}}, State) ->
+    case ocpp_message:request_type(Message) of
+        'GetBaseReport' ->
+            MessageId = ocpp_message:id(Message),
+            case ocpp_message:get(<<"reportBase">>, Message) of
+                <<"FullInventory">> ->
+                    ocpp_client:rpcreply(
+                      State#state.client, MessageId, 'GetBaseReport', #{status => <<"Accepted">>}),
+                    RequestId = ocpp_message:get(<<"requestId">>, Message),
+                    send_base_report('FullInventory', RequestId, State);
+                _ ->
+                    ocpp_client:rpcreply(
+                      State#state.client, MessageId, 'GetBaseReport', #{status => <<"NotSupported">>})
+            end;
+        Type ->
+            logger:warning("unhandled message type: ~p ~p", [Type, Message]),
+            ok
+    end,
+    {noreply, State};
+handle_info(send_heartbeat, State) ->
+    ocpp_client:send_heartbeat(State#state.client),
+    {noreply, State};
 handle_info({arrival, SoC, Token}, State) ->
     new_arrival(self(), SoC, Token),
     {noreply, State#state{arrival_timer = start_arrival_timer(State#state.arrival_rate)}}.
+
+send_base_report('FullInventory', RequestId, State) ->
+    %% XXX: This is not complete per the requirements of the standard (B07.FR.08)
+    Time = list_to_binary(calendar:system_time_to_rfc3339(
+                            erlang:system_time(second), [{offset, "Z"}, {unit, second}])),
+    Data = [#{component => #{name => <<"EVSE">>, evse => #{id => N}},
+              variable => #{name => <<"AvailabilityState">>},
+              variableAttribute => [#{value => atom_to_binary(EVSE#evse.status)}]}
+            || {N, EVSE} <- lists:zip(lists:seq(1, State#state.num_evse), State#state.evse)],
+    Payload = #{requestId => RequestId,
+                generatedAt => Time,
+                reportData => Data,
+                seqNo => 0},
+    Response = ocpp_client:send_report(State#state.client, Payload),
+    logger:info("Server response to report: ~p", [Response]).
 
 send_status(State) ->
     lists:foreach(
