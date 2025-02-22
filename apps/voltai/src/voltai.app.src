@@ -1,0 +1,16 @@
+{application, voltai, [
+    {description, "Charging Station Simulator"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {mod, {voltai, []}},
+    {applications, [
+        kernel,
+        stdlib,
+        ocpp,
+        gun
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {links, []}
+ ]}.

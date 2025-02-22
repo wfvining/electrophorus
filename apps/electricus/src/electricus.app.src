@@ -1,0 +1,17 @@
+{application, electricus, [
+    {description, "An OCPP Charging Station Mnangement Server"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {mod, {electricus, []}},
+    {applications, [
+        kernel,
+        stdlib,
+        crypto,
+        ocpp,
+        cowboy
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {links, []}
+ ]}.
