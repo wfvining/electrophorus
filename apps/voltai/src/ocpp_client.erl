@@ -77,7 +77,8 @@ disconnected(_, _, _) ->
 upgrade(state_timeout, upgrade_failed, _State) ->
     {stop, upgrade_failed};
 upgrade(info, {gun_upgrade, _, _, [<<"websocket">>], _}, State) ->
-    {ok, Timer} = timer:apply_interval(20000, gun, ws_send, [State#state.conn, State#state.ws, ping]),
+    {ok, Timer} =
+        timer:apply_interval(20000, gun, ws_send, [State#state.conn, State#state.ws, ping]),
     {next_state, connected, State#state{ping_timer = Timer}};
 upgrade(info, Message, _State) ->
     io:format("got message: ~p", [Message]),
