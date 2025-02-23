@@ -7,7 +7,7 @@
 -behavior(gen_statem).
 
 -export([start_link/4, connect/3, send_boot_notification/3, send_status_notification/4,
-         send_heartbeat/1, rpcreply/4, send_report/2]).
+         send_heartbeat/1, rpcreply/4, send_report/2, set_heartbeat_interval/2]).
 -export([callback_mode/0, init/1]).
 -export([disconnected/3, upgrade/3, connected/3]).
 
@@ -19,6 +19,7 @@
          password :: binary(),
          pending = [] :: [{binary(), atom(), gen_statem:from()}],
          ping_timer :: timer:tref(),
+         heartbeat_timer :: timer:tref() | undefined,
          path :: string()}).
 
 start_link(URL, UserName, Password, StationPid) ->
@@ -44,6 +45,9 @@ send_report(Conn, Payload) ->
 
 rpcreply(Conn, MessageId, Type, Payload) ->
     gen_statem:cast(Conn, {rpcreply, MessageId, Type, Payload}).
+
+set_heartbeat_interval(Conn, IntervalSec) ->
+    gen_statem:cast(Conn, {set_heartbeat_interval, IntervalSec}).
 
 init({URL, UserName, Password, StationPid}) ->
     {ok,
@@ -128,6 +132,13 @@ connected(cast, {rpcreply, MessageId, Type, Payload}, State) ->
     RPCCall = ocpp_rpc:encode_callresult(Msg),
     gun:ws_send(State#state.conn, State#state.ws, [{text, RPCCall}]),
     {keep_state, State};
+connected(cast, {set_heartbeat_interval, IntervalSec}, #state{heartbeat_timer = undefined} = State) ->
+    {ok, TRef} = timer:apply_interval(timer:seconds(IntervalSec), ocpp_client, send_heartbeat, [self()]),
+    {keep_state, State#state{heartbeat_timer = TRef}};
+connected(cast, {set_heartbeat_interval, IntervalSec}, #state{heartbeat_timer = Timer} = State) ->
+    timer:cancel(Timer),
+    {ok, TRef} = timer:apply_interval(timer:seconds(IntervalSec), ocpp_client, send_heartbeat, [self()]),
+    {keep_state, State#state{heartbeat_timer = TRef}};
 connected(info, {gun_down, _, _, _, _, _}, _State) ->
     {stop, connection_down};
 connected(info, {gun_ws, _, _, {close, _}}, State) ->

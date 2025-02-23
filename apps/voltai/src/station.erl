@@ -31,8 +31,6 @@
          queue = queue:new() :: queue:queue({float(), binary()}),
          csms :: {string(), inet:port_number()},
          client :: pid() | undefined,
-         heartbeat_interval = 3600000 :: pos_integer(),
-         heartbeat :: timer:tref() | undefined,
          evse :: [#evse{}]}).
 
 -spec start_link(Name :: string(),
@@ -87,9 +85,9 @@ handle_continue({connect, Password}, State = #state{csms = {Server, Port}}) ->
             end,
             NewState = State#state{client = Pid},
             send_status(NewState),
-            send_heartbeat(NewState),
-            HeartbeatTimer = timer:send_interval(Interval * 1000, send_heartbeat),
-            {noreply, NewState#state{heartbeat_interval = Interval * 1000, heartbeat = HeartbeatTimer}};
+            ocpp_client:send_heartbeat(Pid),
+            ocpp_client:set_heartbeat_interval(Pid, Interval),
+            {noreply, NewState};
         <<"Pending">> ->
             logger:error("Handling pending state not implemented. Exiting."),
             {stop, normal};
@@ -132,9 +130,6 @@ handle_info({ocpp, {call, Message}}, State) ->
             ok
     end,
     {noreply, State};
-handle_info(send_heartbeat, State) ->
-    ocpp_client:send_heartbeat(State#state.client),
-    {noreply, State};
 handle_info({arrival, SoC, Token}, State) ->
     new_arrival(self(), SoC, Token),
     {noreply, State#state{arrival_timer = start_arrival_timer(State#state.arrival_rate)}}.
@@ -160,9 +155,6 @@ send_status(State) ->
               ocpp_client:send_status_notification(State#state.client, N, 1, EVSE#evse.status)
       end,
       lists:zip(lists:seq(1, State#state.num_evse), State#state.evse)).
-
-send_heartbeat(State) ->
-    ocpp_client:send_heartbeat(State#state.client).
 
 charger_available(EVSEs) ->
     lists:any(fun(EVSE) -> EVSE#evse.state =:= empty end, EVSEs).
