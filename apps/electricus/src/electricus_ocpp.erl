@@ -11,10 +11,16 @@
 -record(state,
         {initialized = false :: boolean(),
          stationid :: binary(),
-         pending_report :: pos_integer() | undefined}).
+         pending_report :: pos_integer() | undefined,
+         heartbeat_interval :: pos_integer()}).
 
-init(StationId) ->
-    {ok, #state{stationid = StationId}}.
+init({StationId, Options}) ->
+    {ok, #state{
+            stationid = StationId,
+            heartbeat_interval = proplists:get_value(
+                                   heartbeat,
+                                   Options,
+                                   application:get_env(electricus, heartbeat_interval, 3600))}}.
 
 handle_ocpp('BootNotification', Message, State) ->
     Response =
@@ -22,7 +28,7 @@ handle_ocpp('BootNotification', Message, State) ->
           currentTime =>
               list_to_binary(calendar:system_time_to_rfc3339(
                                  erlang:system_time(second), [{offset, "Z"}, {unit, second}])),
-          interval => application:get_env(electricus, heartbeat_interval, 3600)},
+          interval => application:get_env(electricus, heartbeat_interval, State#state.heartbeat_interval)},
     Reply = ocpp_message:new_response('BootNotification', Response, ocpp_message:id(Message)),
     if not State#state.initialized ->
            ocpp_station:reply(State#state.stationid, Reply),
