@@ -51,6 +51,16 @@ handle_ocpp('BootNotification', Message, State) ->
        true ->
            {reply, Reply, State}
     end;
+handle_ocpp('Authorize', Message, State) ->
+    Response = ocpp_message:new_response('Authorize', #{idTokenInfo => #{status => <<"Accepted">>}},
+                                         ocpp_message:id(Message)),
+    {reply, Response, State};
+handle_ocpp('TransactionEvent', Message, State) ->
+    Response = ocpp_message:new_response(
+                 'TransactionEvent',
+                 #{idTokenInfo => #{status => <<"Accepted">>}},
+                 ocpp_message:id(Message)),
+    {reply, Response, State};
 handle_ocpp(_, Message, State) ->
     {error, ocpp_error:new('NotSupported', ocpp_message:id(Message)), State}.
 
