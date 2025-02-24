@@ -16,7 +16,7 @@
         {state = empty :: evsestate(),
          status = 'Available' :: evsestatus(),
          last_event = calendar:universal_time() :: calendar:datetime(),
-         event_timer :: reference() | undefined,
+         event_timer :: timer:tref() | undefined,
          kwh_total = 0.0 :: float(),
          kwh_session = 0.0 :: float(),
          kw_max = 200.0 :: float(),
@@ -99,7 +99,7 @@ handle_continue(check_queue, State = #state{queue = Q}) ->
     ChargerAvailable = charger_available(State#state.evse),
     case queue:out(Q) of
         {{value, {SoC, Token}}, Q1} when ChargerAvailable ->
-            {noreply, start_charging(State#state{queue = Q1}, SoC, Token)};
+            {noreply, start_session(State#state{queue = Q1}, SoC, Token)};
         _ ->
             {noreply, State}
     end.
@@ -159,9 +159,102 @@ send_status(State) ->
 charger_available(EVSEs) ->
     lists:any(fun(EVSE) -> EVSE#evse.state =:= empty end, EVSEs).
 
-start_charging(State, SoC, Token) ->
-    %% TODO
-    State.
+start_session(State, SoC, Token) ->
+    %% 1. Select EVSE
+    {ok, EVSEId} = select_evse(State#state.evse),
+    %% 2. Send AuthorizeRequest
+    case ocpp_client:send_authorize_request(State#state.client, Token) of
+        {ok, AuthorizeResponse} ->
+            %% 3. Check if Accepted
+            case ocpp_message:get(<<"idTokenInfo/status">>, AuthorizeResponse) of
+                <<"Accepted">> ->
+                    logger:info("Session authorized at EVSE ~p", [EVSEId]),
+                    %% 4. Send StartTransaction
+                    start_transaction(State, EVSEId, SoC, Token);
+                Status ->
+                    logger:warning("Session authorization failed: ~p", [Status]),
+                    State
+            end;
+        {error, {ocpp, Reason, _, Details}} ->
+            logger:error("AuthorizeRequest failed: ~p (~p)", [Reason, Details]),
+            State
+    end.
+
+start_transaction(State, EVSEId, SoC, Token) ->
+    TransactionId = identifier_string(),
+    case ocpp_client:start_transaction(
+           State#state.client,
+           <<"Authorized">>,
+           TransactionId,
+           Token,
+           EVSEId)
+    of
+        {ok, TransactionResponse} ->
+            case ocpp_message:get(<<"idTokenInfo/status">>, TransactionResponse) of
+                <<"Accepted">> ->
+                    %% 5. Update state of the EVSE
+                    %%    - schedule stop charging
+                    logger:info("Transaction started at EVSE ~p", [EVSEId]),
+                    start_charging(State, EVSEId, SoC, Token, TransactionId);
+                Status ->
+                    logger:warning("Transaction at EVSE ~p not allowed: ~p", [EVSEId, Status]),
+                    State
+            end;
+        {error, {ocpp, Reason, _, Details}} ->
+            logger:error("TransactionRequest failed: ~p (~p)", [Reason, Details]),
+            State
+    end.
+
+start_charging(State, EVSEId, SoC, Token, TransactionId) ->
+    maybe
+        %% 6. Send status notification for EVSE
+        {ok, _} ?= ocpp_client:send_status_notification(State#state.client, EVSEId, 1, <<"Occupied">>),
+        %% 7. Send transaction update with triggerReason = CablePluggedIn, chargingState = EVConnected
+        {ok, TxResponse} ?=
+            ocpp_client:update_transaction(
+              State#state.client, <<"CablePluggedIn">>, TransactionId, Token, EVSEId,
+              [{charging_state, <<"EVConnected">>}]),
+        <<"Accepted">> ?= ocpp_message:get(<<"idTokenInfo/status">>, TxResponse),
+        %% 8. Send transaction update with triggerReason = ChargingStateChanged, chargingState = Charging
+        {ok, TxResponse1} ?=
+            ocpp_client:update_transaction(
+              State#state.client, <<"ChargingStateChanged">>, TransactionId, Token, EVSEId,
+              [{charging_state, <<"Charging">>}]),
+        <<"Accepted">> ?= ocpp_message:get(<<"idTokenInfo/status">>, TxResponse1),
+        %% 9. Schedule charging end
+        %% 10. Update EVSE list and return updated State
+        set_charging_state(State, EVSEId, SoC, Token, TransactionId)
+    else
+        Reason ->
+            logger:error("Start charging failed ~p", Reason),
+            State
+    end.
+
+set_charging_state(State, EVSEId, SoC, Token, TransactionId) ->
+    {First, [EVSE|Rest]} = lists:split(EVSEId - 1, State#state.evse),
+    KWhNeeded = 130.0 - (130.0 * SoC),
+    Duration = round(3600_000.0 * KWhNeeded / EVSE#evse.kw_max),
+    io:format("kWh Needed: ~p, Duration: ~p", [KWhNeeded, Duration]),
+    NewEVSEList =
+        First ++ [EVSE#evse{
+                    kw = EVSE#evse.kw_max,
+                    kwh_session = 0.0,
+                    token = Token,
+                    last_event = calendar:universal_time(),
+                    transaction_id = TransactionId,
+                    event_timer = timer:send_after(Duration, {charging_done, EVSEId})}
+                 | Rest],
+    State#state{evse = NewEVSEList}.
+
+select_evse(EVSEs) ->
+    case lists:search(fun({_, EVSE}) -> EVSE#evse.state =:= empty end,
+                      lists:zip(lists:seq(1, length(EVSEs)), EVSEs))
+    of
+        {value, {N, _EVSE}} ->
+            {ok, N};
+        false ->
+            {error, none_available}
+    end.
 
 model(#state{arrival_rate = ArrivalRate}) when ArrivalRate > 0.0 ->
     <<"Poisson">>;
@@ -175,8 +268,11 @@ start_arrival_timer(ArrivalRate) when ArrivalRate > 0.0 ->
     SoC = min(0.99, max(0.01, rand:normal(0.25, 0.25))),
     %% This should probably be a uuid, but I don't really care about
     %% collisions (which are unlikely at the scale of a demo anyway)
-    Token = << <<($! + B rem ($~ - $!)):8>> || <<B:8>> <= rand:bytes(36) >>,
+    Token = identifier_string(),
     timer:send_after(timer:seconds(T), {arrival, SoC, Token}).
+
+identifier_string() ->
+    << <<($! + B rem ($~ - $!)):8>> || <<B:8>> <= rand:bytes(36) >>.
 
 exponential(Rate) ->
     U = rand:uniform_real(),

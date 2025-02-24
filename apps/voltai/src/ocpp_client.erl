@@ -7,7 +7,8 @@
 -behavior(gen_statem).
 
 -export([start_link/4, connect/3, send_boot_notification/3, send_status_notification/4,
-         send_heartbeat/1, rpcreply/4, send_report/2, set_heartbeat_interval/2]).
+         send_heartbeat/1, rpcreply/4, send_report/2, set_heartbeat_interval/2,
+         send_authorize_request/2, start_transaction/5, update_transaction/6]).
 -export([callback_mode/0, init/1]).
 -export([disconnected/3, upgrade/3, connected/3]).
 
@@ -20,13 +21,17 @@
          pending = [] :: [{binary(), atom(), gen_statem:from()}],
          ping_timer :: timer:tref(),
          heartbeat_timer :: timer:tref() | undefined,
-         path :: string()}).
+         path :: string(),
+         sequence_numbers = #{} :: #{pos_integer() => non_neg_integer()}}).
 
 start_link(URL, UserName, Password, StationPid) ->
     gen_statem:start_link(?MODULE, {URL, UserName, Password, StationPid}, []).
 
 connect(URL, UserName, Password) ->
     client_sup:start_client(URL, UserName, Password, self()).
+
+send_authorize_request(Conn, Token) ->
+    gen_statem:call(Conn, {send_authorize, Token}).
 
 send_heartbeat(Conn) ->
     gen_statem:call(Conn, send_heartbeat).
@@ -42,6 +47,30 @@ send_status_notification(Conn, EVSEId, ConnectorId, Status) ->
 
 send_report(Conn, Payload) ->
     gen_statem:call(Conn, {send_report, Payload}).
+
+start_transaction(Conn, Reason, TransactionId, Token, EVSEId) ->
+    Time =
+        list_to_binary(calendar:system_time_to_rfc3339(
+                           erlang:system_time(second), [{offset, "Z"}, {unit, second}])),
+    TxInfo = #{transactionId => TransactionId},
+    EVSE = #{id => EVSEId, connectorId => 1},
+    gen_statem:call(Conn,
+                    {transaction_event, <<"Started">>, Time, Reason, TxInfo, Token, EVSE}).
+
+update_transaction(Conn, Reason, TransactionId, Token, EVSEId, Options) ->
+    Time =
+        list_to_binary(calendar:system_time_to_rfc3339(
+                           erlang:system_time(second), [{offset, "Z"}, {unit, second}])),
+    TxInfo =
+        case proplists:get_value(charging_state, Options) of
+            undefined ->
+                #{transactionId => TransactionId};
+            State ->
+                #{transactionId => TransactionId, chargingState => State}
+        end,
+    EVSE = #{id => EVSEId, connectorId => 1},
+    gen_statem:call(Conn,
+                    {transaction_event, <<"Updated">>, Time, Reason, TxInfo, Token, EVSE}).
 
 rpcreply(Conn, MessageId, Type, Payload) ->
     gen_statem:cast(Conn, {rpcreply, MessageId, Type, Payload}).
@@ -96,6 +125,13 @@ upgrade(info, Message, _State) ->
 upgrade(_, _, _) ->
     {keep_state_and_data, [postpone]}.
 
+connected({call, From}, {send_authorize, IdToken}, State) ->
+    Msg = ocpp_message:new_request('Authorize',
+                                   #{idToken => #{idToken => IdToken, type => <<"Local">>}}),
+    RPCCall = ocpp_rpc:encode_call(Msg),
+    ok = gun:ws_send(State#state.conn, State#state.ws, [{text, RPCCall}]),
+    {keep_state,
+     State#state{pending = [{ocpp_message:id(Msg), 'Authorize', From} | State#state.pending]}};
 connected({call, From}, {send_boot, Reason, Station}, State) ->
     Msg = ocpp_message:new_request('BootNotification',
                                    [{"chargingStation", Station}, {"reason", Reason}]),
@@ -104,6 +140,26 @@ connected({call, From}, {send_boot, Reason, Station}, State) ->
     {keep_state,
      State#state{pending =
                      [{ocpp_message:id(Msg), 'BootNotification', From} | State#state.pending]}};
+connected({call, From},
+          {transaction_event, EventType, Time, Reason, TxInfo, Token, EVSE},
+          State) ->
+    EVSEId = maps:get(id, EVSE, 1),
+    Seq = maps:get(EVSEId, State#state.sequence_numbers, 0),
+    Msg = ocpp_message:new_request('TransactionEvent',
+                                   #{eventType => EventType,
+                                     timestamp => Time,
+                                     triggerReason => Reason,
+                                     seqNo => Seq,
+                                     transactionInfo => TxInfo,
+                                     idToken => #{idToken => Token, type => <<"Local">>},
+                                     evse => EVSE}),
+    RPCCall = ocpp_rpc:encode_call(Msg),
+    ok = gun:ws_send(State#state.conn, State#state.ws, [{text, RPCCall}]),
+    {keep_state,
+     State#state{pending =
+                     [{ocpp_message:id(Msg), 'TransactionEvent', From} | State#state.pending],
+                 sequence_numbers =
+                     maps:put(EVSEId, (Seq + 1) rem 2147483647, State#state.sequence_numbers)}};
 connected({call, From}, {send_status, EVSEId, ConnectorId, Status, Time}, State) ->
     Msg = ocpp_message:new_request('StatusNotification',
                                    #{timestamp => Time,
@@ -119,8 +175,9 @@ connected({call, From}, {send_report, Payload}, State) ->
     Msg = ocpp_message:new_request('NotifyReport', Payload),
     RPCCall = ocpp_rpc:encode_call(Msg),
     ok = gun:ws_send(State#state.conn, State#state.ws, [{text, RPCCall}]),
-    {keep_state, 
-     State#state{pending = [{ocpp_message:id(Msg), 'StatusNotification', From} | State#state.pending]}};
+    {keep_state,
+     State#state{pending =
+                     [{ocpp_message:id(Msg), 'StatusNotification', From} | State#state.pending]}};
 connected({call, From}, send_heartbeat, State) ->
     Msg = ocpp_message:new_request('Heartbeat', #{}),
     RPCCall = ocpp_rpc:encode_call(Msg),
@@ -132,12 +189,20 @@ connected(cast, {rpcreply, MessageId, Type, Payload}, State) ->
     RPCCall = ocpp_rpc:encode_callresult(Msg),
     gun:ws_send(State#state.conn, State#state.ws, [{text, RPCCall}]),
     {keep_state, State};
-connected(cast, {set_heartbeat_interval, IntervalSec}, #state{heartbeat_timer = undefined} = State) ->
-    {ok, TRef} = timer:apply_interval(timer:seconds(IntervalSec), ocpp_client, send_heartbeat, [self()]),
+connected(cast,
+          {set_heartbeat_interval, IntervalSec},
+          #state{heartbeat_timer = undefined} = State) ->
+    {ok, TRef} =
+        timer:apply_interval(
+            timer:seconds(IntervalSec), ocpp_client, send_heartbeat, [self()]),
     {keep_state, State#state{heartbeat_timer = TRef}};
-connected(cast, {set_heartbeat_interval, IntervalSec}, #state{heartbeat_timer = Timer} = State) ->
+connected(cast,
+          {set_heartbeat_interval, IntervalSec},
+          #state{heartbeat_timer = Timer} = State) ->
     timer:cancel(Timer),
-    {ok, TRef} = timer:apply_interval(timer:seconds(IntervalSec), ocpp_client, send_heartbeat, [self()]),
+    {ok, TRef} =
+        timer:apply_interval(
+            timer:seconds(IntervalSec), ocpp_client, send_heartbeat, [self()]),
     {keep_state, State#state{heartbeat_timer = TRef}};
 connected(info, {gun_down, _, _, _, _, _}, _State) ->
     {stop, connection_down};
@@ -160,7 +225,7 @@ connected(info, {gun_ws, _, _, {text, Msg}}, State) ->
         {ok, {call, _MessageId, Message}} ->
             State#state.station ! {ocpp, {call, Message}},
             keep_state_and_data;
-        {ok, {callerror, Error}} ->
+        {error, Error} ->
             MessageId = ocpp_error:id(Error),
             Reason = ocpp_error:type(Error),
             Description = ocpp_error:description(Error),
